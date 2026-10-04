@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -95,15 +96,17 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 	reqURL := c.baseURL + path + sep + "api_key=" + url.QueryEscape(c.apiKey)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// reqURL carries the API key and a *url.Error prints the whole URL,
+		// so these errors drop the query string before the host logs them.
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
-			return fmt.Errorf("tmdb: create request: %w", err)
+			return fmt.Errorf("tmdb: create request: %w", redactURLError(err))
 		}
 		req.Header.Set("Accept", "application/json")
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			return fmt.Errorf("tmdb: request failed: %w", err)
+			return fmt.Errorf("tmdb: request failed: %w", redactURLError(err))
 		}
 
 		// 429 Too Many Requests — respect Retry-After header.
@@ -156,6 +159,37 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		return nil
 	}
 	return fmt.Errorf("tmdb: max retries exceeded")
+}
+
+// redactURLError returns err with the query string and fragment removed from
+// every requested URL it names. TMDB v3 authenticates with an api_key query
+// parameter, and net/http reports transport failures as a *url.Error whose
+// text includes the full URL. The Op and the underlying cause are kept, so
+// errors.Is and errors.As still reach context.Canceled, *net.OpError, and
+// the rest of the transport chain.
+//
+// err is expected to come straight from net/http, which returns a *url.Error
+// directly. An error without a *url.Error in its chain is returned unchanged.
+func redactURLError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	return &url.Error{
+		Op:  urlErr.Op,
+		URL: redactURL(urlErr.URL),
+		// A nested *url.Error's URL can carry the key just the same.
+		Err: redactURLError(urlErr.Err),
+	}
+}
+
+// redactURL cuts rawURL at its query string or fragment. It works on the raw
+// text so that a URL net/http could not parse is redacted the same way.
+func redactURL(rawURL string) string {
+	if i := strings.IndexAny(rawURL, "?#"); i >= 0 {
+		return rawURL[:i]
+	}
+	return rawURL
 }
 
 // retryAfterOrDefault parses the Retry-After header (seconds) or falls back
