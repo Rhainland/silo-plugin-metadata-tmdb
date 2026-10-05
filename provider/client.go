@@ -96,17 +96,15 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 	reqURL := c.baseURL + path + sep + "api_key=" + url.QueryEscape(c.apiKey)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		// reqURL carries the API key and a *url.Error prints the whole URL,
-		// so these errors drop the query string before the host logs them.
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
-			return fmt.Errorf("tmdb: create request: %w", redactURLError(err))
+			return fmt.Errorf("tmdb: create request: %w", redactURLError(err, c.apiKey))
 		}
 		req.Header.Set("Accept", "application/json")
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			return fmt.Errorf("tmdb: request failed: %w", redactURLError(err))
+			return fmt.Errorf("tmdb: request failed: %w", redactURLError(err, c.apiKey))
 		}
 
 		// 429 Too Many Requests — respect Retry-After header.
@@ -163,24 +161,44 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 
 // redactURLError returns err with the query string and fragment removed from
 // every requested URL it names. TMDB v3 authenticates with an api_key query
-// parameter, and net/http reports transport failures as a *url.Error whose
+// parameter, and net/http reports request failures as a *url.Error whose
 // text includes the full URL. The Op and the underlying cause are kept, so
 // errors.Is and errors.As still reach context.Canceled, *net.OpError, and
 // the rest of the transport chain.
 //
 // err is expected to come straight from net/http, which returns a *url.Error
-// directly. An error without a *url.Error in its chain is returned unchanged.
-func redactURLError(err error) error {
-	var urlErr *url.Error
-	if !errors.As(err, &urlErr) {
-		return err
+// itself rather than wrapped. Any other error, including the cause below a
+// *url.Error, passes through unless its text contains apiKey. Then it is
+// replaced by a plain error with the key masked; net/http's error for a
+// redirect Location header it cannot parse quotes the header that way.
+func redactURLError(err error, apiKey string) error {
+	urlErr, ok := err.(*url.Error) //nolint:errorlint // net/http returns *url.Error unwrapped
+	if !ok {
+		return maskAPIKey(err, apiKey)
 	}
 	return &url.Error{
 		Op:  urlErr.Op,
 		URL: redactURL(urlErr.URL),
-		// A nested *url.Error's URL can carry the key just the same.
-		Err: redactURLError(urlErr.Err),
+		// net/http never nests a *url.Error today; this is defensive.
+		Err: redactURLError(urlErr.Err, apiKey),
 	}
+}
+
+// maskAPIKey returns err unchanged unless its text contains apiKey, in which
+// case it returns a plain error with each occurrence replaced by REDACTED.
+func maskAPIKey(err error, apiKey string) error {
+	if err == nil || apiKey == "" {
+		return err
+	}
+	message := err.Error()
+	masked := strings.ReplaceAll(message, apiKey, "REDACTED")
+	if escaped := url.QueryEscape(apiKey); escaped != apiKey {
+		masked = strings.ReplaceAll(masked, escaped, "REDACTED")
+	}
+	if masked == message {
+		return err
+	}
+	return errors.New(masked)
 }
 
 // redactURL cuts rawURL at its query string or fragment. It works on the raw

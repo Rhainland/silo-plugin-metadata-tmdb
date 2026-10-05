@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/Silo-Server/silo-plugin-tmdb/metadata"
@@ -35,21 +36,28 @@ func assertNoAPIKey(t *testing.T, err error) {
 	}
 }
 
-// closedServerURL returns the URL of a server that no longer listens, so a
-// request to it fails in transport.
-func closedServerURL(t *testing.T) string {
-	t.Helper()
-	server := httptest.NewServer(http.NotFoundHandler())
-	baseURL := server.URL
-	server.Close()
-	return baseURL
+// refusingTransport refuses every request to refusedHost as a dial would, and
+// sends any other request through http.DefaultTransport. An empty refusedHost
+// refuses everything. It keeps transport-error tests independent of whether a
+// closed loopback port has been handed out again.
+type refusingTransport struct {
+	refusedHost string
+}
+
+func (t refusingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.refusedHost == "" || req.URL.Host == t.refusedHost {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 func TestTransportErrorsLeaveOutTheAPIKey(t *testing.T) {
 	t.Parallel()
 
-	baseURL := closedServerURL(t)
-	p := NewProviderWithClient(newKeyedTestClient(baseURL))
+	const baseURL = "http://tmdb.test"
+	client := newKeyedTestClient(baseURL)
+	client.httpClient.Transport = refusingTransport{}
+	p := NewProviderWithClient(client)
 
 	_, err := p.Search(context.Background(), metadata.SearchQuery{Title: "Movie", ContentType: "movie"})
 	assertNoAPIKey(t, err)
@@ -98,17 +106,50 @@ func TestCanceledRequestErrorKeepsItsCause(t *testing.T) {
 func TestRedirectTransportErrorLeavesOutTheAPIKey(t *testing.T) {
 	t.Parallel()
 
-	target := closedServerURL(t) + "/configuration?api_key=" + testAPIKey
+	const refusedHost = "refused.test"
+	target := "http://" + refusedHost + "/configuration?api_key=" + testAPIKey
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target, http.StatusFound)
 	}))
 	defer server.Close()
 
-	err := newKeyedTestClient(server.URL).loadConfiguration(context.Background())
+	client := newKeyedTestClient(server.URL)
+	client.httpClient.Transport = refusingTransport{refusedHost: refusedHost}
+	err := client.loadConfiguration(context.Background())
 	assertNoAPIKey(t, err)
 	var opErr *net.OpError
 	if !errors.As(err, &opErr) {
 		t.Fatalf("error %v no longer wraps the transport *net.OpError", err)
+	}
+}
+
+func TestMalformedRedirectLocationLeavesOutTheAPIKey(t *testing.T) {
+	t.Parallel()
+
+	// net/http cannot parse this Location and quotes it in the error text.
+	location := "/3/configuration/%zz?api_key=" + testAPIKey
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", location)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer server.Close()
+
+	err := newKeyedTestClient(server.URL).loadConfiguration(context.Background())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), testAPIKey) {
+		t.Fatalf("error carries the API key: %v", err)
+	}
+	if !strings.Contains(err.Error(), "api_key=REDACTED") {
+		t.Fatalf("error lost the masked Location: %v", err)
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("error %v does not wrap a *url.Error", err)
+	}
+	if want := server.URL + "/configuration"; urlErr.URL != want {
+		t.Fatalf("error URL = %q, want %q", urlErr.URL, want)
 	}
 }
 
@@ -148,6 +189,7 @@ func TestStatusErrorLeavesOutTheAPIKey(t *testing.T) {
 func TestRedactURLErrorRedactsNestedURLErrors(t *testing.T) {
 	t.Parallel()
 
+	// net/http does not nest a *url.Error; this covers the defensive branch.
 	cause := errors.New("connection refused")
 	err := redactURLError(&url.Error{
 		Op:  "Get",
@@ -157,7 +199,7 @@ func TestRedactURLErrorRedactsNestedURLErrors(t *testing.T) {
 			URL: "https://redirect.example/3/configuration?api_key=" + testAPIKey + "#fragment",
 			Err: cause,
 		},
-	})
+	}, testAPIKey)
 
 	assertNoAPIKey(t, err)
 	want := `Get "https://api.themoviedb.org/3/configuration": Get "https://redirect.example/3/configuration": connection refused`
@@ -172,10 +214,10 @@ func TestRedactURLErrorRedactsNestedURLErrors(t *testing.T) {
 func TestRedactURLErrorPassesOtherErrorsThrough(t *testing.T) {
 	t.Parallel()
 
-	if err := redactURLError(nil); err != nil {
+	if err := redactURLError(nil, testAPIKey); err != nil {
 		t.Fatalf("redactURLError(nil) = %v, want nil", err)
 	}
-	if err := redactURLError(context.DeadlineExceeded); err != context.DeadlineExceeded { //nolint:errorlint // identity is the point
+	if err := redactURLError(context.DeadlineExceeded, testAPIKey); err != context.DeadlineExceeded { //nolint:errorlint // identity is the point
 		t.Fatalf("redactURLError changed a non-URL error: %v", err)
 	}
 }
