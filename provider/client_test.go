@@ -110,6 +110,7 @@ func TestRedactURL(t *testing.T) {
 		{"fragment dropped", "/3/movie/1?api_key=" + testAPIKey + "#" + testAPIKey, "/3/movie/1?api_key=REDACTED"},
 		{"key elsewhere", "/3/" + testAPIKey + "/x?query=a", "/3/REDACTED/x?query=a"},
 		{"unparseable", "/3/movie/%zz?api_key=" + testAPIKey, "/3/movie/%zz?api_key=REDACTED"},
+		{"escaped name and value", "/3/movie/1?%61pi_key=%73ecret-test-key&page=2", "/3/movie/1?api_key=REDACTED&page=2"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -223,13 +223,23 @@ func redactURL(rawURL, apiKey string) string {
 	if base, query, ok := strings.Cut(rawURL, "?"); ok {
 		params := strings.Split(query, "&")
 		for i, param := range params {
-			if name, _, _ := strings.Cut(param, "="); name == "api_key" {
+			if isAPIKeyParam(param) {
 				params[i] = "api_key=REDACTED"
 			}
 		}
 		rawURL = base + "?" + strings.Join(params, "&")
 	}
 	return maskAPIKeyText(rawURL, apiKey)
+}
+
+// isAPIKeyParam reports whether a raw name=value query parameter is named
+// api_key, matching percent-encoded spellings such as %61pi_key too.
+func isAPIKeyParam(param string) bool {
+	name, _, _ := strings.Cut(param, "=")
+	if decoded, err := url.QueryUnescape(name); err == nil {
+		name = decoded
+	}
+	return name == "api_key"
 }
 
 // retryAfterOrDefault parses the Retry-After header (seconds) or falls back
