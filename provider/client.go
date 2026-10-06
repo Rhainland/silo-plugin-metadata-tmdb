@@ -159,12 +159,13 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 	return fmt.Errorf("tmdb: max retries exceeded")
 }
 
-// redactURLError returns err with the query string and fragment removed from
-// every requested URL it names. TMDB v3 authenticates with an api_key query
-// parameter, and net/http reports request failures as a *url.Error whose
-// text includes the full URL. The Op and the underlying cause are kept, so
-// errors.Is and errors.As still reach context.Canceled, *net.OpError, and
-// the rest of the transport chain.
+// redactURLError returns err with the api_key value masked and the fragment
+// removed in every requested URL it names. TMDB v3 authenticates with an
+// api_key query parameter, and net/http reports request failures as a
+// *url.Error whose text includes the full URL. The other query parameters
+// stay, so a failed search still names its title, year, and page. The Op and
+// the underlying cause are kept, so errors.Is and errors.As still reach
+// context.Canceled, *net.OpError, and the rest of the transport chain.
 //
 // err is expected to come straight from net/http, which returns a *url.Error
 // itself rather than wrapped. Any other error, including the cause below a
@@ -178,7 +179,7 @@ func redactURLError(err error, apiKey string) error {
 	}
 	return &url.Error{
 		Op:  urlErr.Op,
-		URL: redactURL(urlErr.URL),
+		URL: redactURL(urlErr.URL, apiKey),
 		// net/http never nests a *url.Error today; this is defensive.
 		Err: redactURLError(urlErr.Err, apiKey),
 	}
@@ -191,23 +192,44 @@ func maskAPIKey(err error, apiKey string) error {
 		return err
 	}
 	message := err.Error()
-	masked := strings.ReplaceAll(message, apiKey, "REDACTED")
-	if escaped := url.QueryEscape(apiKey); escaped != apiKey {
-		masked = strings.ReplaceAll(masked, escaped, "REDACTED")
-	}
+	masked := maskAPIKeyText(message, apiKey)
 	if masked == message {
 		return err
 	}
 	return errors.New(masked)
 }
 
-// redactURL cuts rawURL at its query string or fragment. It works on the raw
-// text so that a URL net/http could not parse is redacted the same way.
-func redactURL(rawURL string) string {
-	if i := strings.IndexAny(rawURL, "?#"); i >= 0 {
-		return rawURL[:i]
+// maskAPIKeyText replaces each raw or query-escaped occurrence of apiKey in
+// text with REDACTED.
+func maskAPIKeyText(text, apiKey string) string {
+	if apiKey == "" {
+		return text
 	}
-	return rawURL
+	masked := strings.ReplaceAll(text, apiKey, "REDACTED")
+	if escaped := url.QueryEscape(apiKey); escaped != apiKey {
+		masked = strings.ReplaceAll(masked, escaped, "REDACTED")
+	}
+	return masked
+}
+
+// redactURL drops rawURL's fragment, replaces the value of every api_key
+// query parameter with REDACTED, and masks any other occurrence of apiKey. It
+// works on the raw text so that a URL net/http could not parse is redacted
+// the same way.
+func redactURL(rawURL, apiKey string) string {
+	if i := strings.IndexByte(rawURL, '#'); i >= 0 {
+		rawURL = rawURL[:i]
+	}
+	if base, query, ok := strings.Cut(rawURL, "?"); ok {
+		params := strings.Split(query, "&")
+		for i, param := range params {
+			if name, _, _ := strings.Cut(param, "="); name == "api_key" {
+				params[i] = "api_key=REDACTED"
+			}
+		}
+		rawURL = base + "?" + strings.Join(params, "&")
+	}
+	return maskAPIKeyText(rawURL, apiKey)
 }
 
 // retryAfterOrDefault parses the Retry-After header (seconds) or falls back

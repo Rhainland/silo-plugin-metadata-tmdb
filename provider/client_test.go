@@ -29,7 +29,7 @@ func assertNoAPIKey(t *testing.T, err error) {
 		t.Fatal("expected an error")
 	}
 	message := err.Error()
-	for _, secret := range []string{testAPIKey, defaultAPIKey, "api_key"} {
+	for _, secret := range []string{testAPIKey, defaultAPIKey} {
 		if strings.Contains(message, secret) {
 			t.Fatalf("error carries %q: %v", secret, err)
 		}
@@ -69,12 +69,55 @@ func TestTransportErrorsLeaveOutTheAPIKey(t *testing.T) {
 	if !errors.As(err, &urlErr) {
 		t.Fatalf("error %v does not wrap a *url.Error", err)
 	}
-	if want := baseURL + "/configuration"; urlErr.URL != want {
+	if want := baseURL + "/configuration?api_key=REDACTED"; urlErr.URL != want {
 		t.Fatalf("error URL = %q, want %q", urlErr.URL, want)
 	}
 	var opErr *net.OpError
 	if !errors.As(err, &opErr) {
 		t.Fatalf("error %v no longer wraps the transport *net.OpError", err)
+	}
+}
+
+func TestTransportErrorKeepsTheRequestQuery(t *testing.T) {
+	t.Parallel()
+
+	const baseURL = "http://tmdb.test"
+	client := newKeyedTestClient(baseURL)
+	client.httpClient.Transport = refusingTransport{}
+
+	var dest map[string]any
+	err := client.doGet(context.Background(), "/search/movie?query=Alien&year=1979&page=2", &dest)
+	assertNoAPIKey(t, err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("error %v does not wrap a *url.Error", err)
+	}
+	if want := baseURL + "/search/movie?query=Alien&year=1979&page=2&api_key=REDACTED"; urlErr.URL != want {
+		t.Fatalf("error URL = %q, want %q", urlErr.URL, want)
+	}
+}
+
+func TestRedactURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, in, want string
+	}{
+		{"no query", "https://api.themoviedb.org/3/configuration", "https://api.themoviedb.org/3/configuration"},
+		{"key only", "https://api.themoviedb.org/3/configuration?api_key=" + testAPIKey, "https://api.themoviedb.org/3/configuration?api_key=REDACTED"},
+		{"key last", "/3/find/tt0078748?external_source=imdb_id&api_key=" + testAPIKey, "/3/find/tt0078748?external_source=imdb_id&api_key=REDACTED"},
+		{"key first", "/3/search/tv?api_key=" + testAPIKey + "&query=Andor", "/3/search/tv?api_key=REDACTED&query=Andor"},
+		{"fragment dropped", "/3/movie/1?api_key=" + testAPIKey + "#" + testAPIKey, "/3/movie/1?api_key=REDACTED"},
+		{"key elsewhere", "/3/" + testAPIKey + "/x?query=a", "/3/REDACTED/x?query=a"},
+		{"unparseable", "/3/movie/%zz?api_key=" + testAPIKey, "/3/movie/%zz?api_key=REDACTED"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := redactURL(tt.in, testAPIKey); got != tt.want {
+				t.Fatalf("redactURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -148,7 +191,7 @@ func TestMalformedRedirectLocationLeavesOutTheAPIKey(t *testing.T) {
 	if !errors.As(err, &urlErr) {
 		t.Fatalf("error %v does not wrap a *url.Error", err)
 	}
-	if want := server.URL + "/configuration"; urlErr.URL != want {
+	if want := server.URL + "/configuration?api_key=REDACTED"; urlErr.URL != want {
 		t.Fatalf("error URL = %q, want %q", urlErr.URL, want)
 	}
 }
@@ -202,7 +245,7 @@ func TestRedactURLErrorRedactsNestedURLErrors(t *testing.T) {
 	}, testAPIKey)
 
 	assertNoAPIKey(t, err)
-	want := `Get "https://api.themoviedb.org/3/configuration": Get "https://redirect.example/3/configuration": connection refused`
+	want := `Get "https://api.themoviedb.org/3/configuration?api_key=REDACTED": Get "https://redirect.example/3/configuration?api_key=REDACTED": connection refused`
 	if err.Error() != want {
 		t.Fatalf("redacted error = %q, want %q", err.Error(), want)
 	}
